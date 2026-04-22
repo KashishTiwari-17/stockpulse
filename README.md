@@ -1,167 +1,88 @@
-# ⚡ StockPulse — Production-Grade Real-Time Stock Dashboard
+# ⚡ StockPulse — Real-Time Stock Trading Dashboard
 
-A full-stack portfolio project demonstrating real-time data streaming, WebSocket pub-sub architecture, and interactive financial charting.
+Full-stack paper trading simulator with live WebSocket price streaming, candlestick charting, and built-in overtrading protection.
+
+**Stack:** FastAPI · React 18 · Vite · yfinance · Finnhub · Canvas2D · aiosqlite
 
 ---
 
-## What's Changed from v1
+## Features
 
-| Area | Old | New |
-|------|-----|-----|
-| **Data source** | yfinance (broken) | **Finnhub** (live quotes) + **Alpha Vantage** (OHLC history) |
-| **Chart library** | chartjs-chart-financial | **Pure Canvas2D** (avoids toString bug in v0.1.1) |
-| **Drawing tools** | None | Trendline, H-Line, Rectangle, Fibonacci, Text, Eraser |
-| **WS connection** | Via Vite proxy | **Direct to backend** `ws://localhost:8000` |
-| **History seeding** | Not implemented | WS sends 1D/5m OHLC on connect |
-| **Candle colors** | All red (flat data bug) | Green (up) / Red (down) / Gray (flat) |
+- **Live candlestick chart** — real OHLC data, updates every 5 seconds via WebSocket
+- **Paper trading** — virtual $10,000 balance, BUY/SELL at live market price, open position P&L
+- **Overtrading protection** — Beginner mode enforces daily limits, cooldowns, and loss halts
+- **Analytics overlay** — SMA-20, SMA-50, RSI-14 computed server-side
+- **Drawing tools** — trend lines, rectangles, horizontal price levels on overlay canvas
+- **Price alerts** — set above/below thresholds, triggered via WebSocket push
+- **Works 24/7** — yfinance fallback serves last close price when markets are closed
+
+---
+
+## The Overtrading Problem I Solved
+
+Overtrading is the #1 mistake new traders make — entering too many trades out of boredom, revenge, or FOMO, compounding losses instead of cutting them. I implemented a **Beginner mode** that enforces three hard guardrails:
+
+### 1. Daily Trade Limit (max 3/day)
+With only 3 trades per day, every entry requires conviction. Forces you to wait for high-confidence setups rather than trading noise.
+
+### 2. Cooldown Timer (5 minutes between trades)
+After closing a position, trading is locked for 5 minutes. Directly prevents **revenge trading** — the impulse to immediately re-enter after a loss to "win it back", which statistically makes losses worse.
+
+### 3. Consecutive Loss Halt (2 losses → halted for the day)
+Two losses in a row signals the market isn't moving in your favour today. The system halts all trading until tomorrow, preventing a bad session from turning into a catastrophic one.
+
+All three rules reset at midnight. **Pro mode** removes all limits for experienced users.
+
+| Rule | Beginner | Pro |
+|---|---|---|
+| Trades per day | 3 | Unlimited |
+| Cooldown between trades | 5 minutes | None |
+| Consecutive loss halt | 2 losses | None |
+| Warning threshold | 2nd trade | 10th trade |
 
 ---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                        Browser                            │
-│   React (Vite)  ←── WebSocket ──┐  ←── REST /api/v1 ──┐  │
-└───────────────────────────────────────────────────────────┘
-                                  │                       │
-                     ┌────────────▼───────────────────────▼──┐
-                     │         FastAPI (uvicorn)              │
-                     │  ┌──────────────┐  ┌───────────────┐  │
-                     │  │  WS Manager  │  │  REST Routes  │  │
-                     │  │  (pub-sub)   │  │  /stock/:t    │  │
-                     │  │  per-ticker  │  │  /analytics   │  │
-                     │  │  room model  │  │  /alerts      │  │
-                     │  └──────┬───────┘  └──────┬────────┘  │
-                     │         │                 │            │
-                     │  ┌──────▼─────────────────▼────────┐  │
-                     │  │         Services Layer           │  │
-                     │  │  stock.py     analytics.py       │  │
-                     │  │  alerts.py    (Finnhub + AV)     │  │
-                     │  └──────────────┬───────────────────┘  │
-                     │                 │                       │
-                     │  ┌──────────────▼───────────────────┐  │
-                     │  │    Data Layer (aiosqlite)        │  │
-                     │  │    candles + alerts tables       │  │
-                     │  └──────────────────────────────────┘  │
-                     └────────────────────────────────────────┘
-                                       │
-                          Finnhub API (live quotes, 60/min free)
-                          Alpha Vantage API (OHLC history, 25/day free)
+Browser (React + Vite)
+    ↕ WebSocket /ws/{ticker}     ← live candle ticks every 5s
+    ↕ REST      /api/v1/...      ← history, analytics, alerts
+
+FastAPI (uvicorn)
+    WS Manager   → pub-sub rooms, CandleAggregator, history seed
+    REST Routes  → stock, history, analytics, portfolio, alerts
+    Services     → stock.py (Finnhub + yfinance), analytics.py, alerts.py
+    DB           → aiosqlite (alerts table)
+
+External APIs
+    Finnhub       → live quotes (free, 60 req/min)
+    yfinance      → OHLC history + after-hours fallback (free, no key)
+    Alpha Vantage → snapshots (free, 25 req/day)
 ```
 
-### Key SDE Concepts Demonstrated
-
-| Concept | Implementation |
-|---|---|
-| **Pub-Sub** | WS manager rooms — 1 stream task per ticker, N clients |
-| **Async I/O** | All I/O non-blocking via FastAPI async handlers |
-| **Rate Limiting** | Sliding-window middleware (60 req/min per IP) |
-| **DB Layer** | Async SQLite with UPSERT, indexed queries |
-| **Type Safety** | Full Pydantic v2 models on all API boundaries |
-| **State Management** | Zustand on frontend |
-| **WS Reconnect** | Exponential backoff reconnect in `useStockSocket` hook |
-| **Canvas2D Charts** | Custom OHLC renderer — no broken third-party lib |
-| **Drawing Tools** | Overlay canvas for non-destructive annotations |
-
----
-
-## Project Structure
-
-```
-stockpulse/
-├── backend/
-│   ├── main.py                 # App factory + lifespan
-│   ├── api/
-│   │   └── routes.py           # REST endpoints
-│   ├── websocket/
-│   │   └── manager.py          # Pub-sub WS hub + history seeding
-│   ├── services/
-│   │   ├── stock.py            # Finnhub quotes + Alpha Vantage OHLC
-│   │   ├── analytics.py        # SMA-20, SMA-50, RSI-14
-│   │   └── alerts.py           # Alert evaluator (background task)
-│   ├── models/
-│   │   └── schemas.py          # Pydantic v2 models
-│   ├── db/
-│   │   └── database.py         # aiosqlite CRUD
-│   ├── middleware/
-│   │   ├── rate_limiter.py     # Sliding-window rate limit
-│   │   └── logging.py          # Structured logging setup
-│   ├── .env                    # API keys (never committed)
-│   └── requirements.txt
-│
-├── frontend/
-│   ├── src/
-│   │   ├── pages/
-│   │   │   └── Dashboard.jsx         # Main layout + orchestration
-│   │   ├── components/
-│   │   │   ├── CandlestickChart.jsx  # Canvas2D OHLC + drawing tools
-│   │   │   ├── PriceTicker.jsx       # Animated price header
-│   │   │   ├── PortfolioPanel.jsx    # Watchlist sidebar
-│   │   │   ├── AlertsPanel.jsx       # Create/view alerts
-│   │   │   ├── RSIChart.jsx          # RSI-14 panel
-│   │   │   ├── NotificationToast.jsx # Alert toasts
-│   │   │   └── ConnectionStatus.jsx  # WS state badge
-│   │   ├── hooks/
-│   │   │   └── useStockSocket.js     # WS + exponential backoff reconnect
-│   │   └── store/
-│   │       └── index.js              # Zustand stores
-│   ├── .env.development        # Local env (gitignored)
-│   ├── .env.production         # Production URLs (committed)
-│   ├── package.json
-│   ├── vite.config.js
-│   └── nginx.conf
-│
-└── docker-compose.yml
-```
+**Why yfinance?** Finnhub's historical candle endpoint requires a paid plan. yfinance wraps Yahoo Finance — same data, completely free, no API key. Finnhub is kept only for the live quote stream where lower latency matters during market hours.
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-- Python 3.10+
-- Node.js 18+
-- Free API keys from [Finnhub](https://finnhub.io/register) and [Alpha Vantage](https://www.alphavantage.co/support/#api-key)
-
-### Backend
+**Prerequisites:** Python 3.10+, Node 18+, free [Finnhub key](https://finnhub.io/register)
 
 ```bash
+# Backend
 cd backend
-
-# Create virtual environment
-python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Mac/Linux
-
+python -m venv venv && venv\Scripts\activate   # Windows
 pip install -r requirements.txt
-
-# Create .env file
 echo FINNHUB_API_KEY=your_key > .env
-echo ALPHA_VANTAGE_API_KEY=your_key >> .env
-
 uvicorn main:app --reload --port 8000
-```
 
-### Frontend
-
-```bash
+# Frontend
 cd frontend
-npm install
-
-# Create .env.development
-echo VITE_API_URL=http://localhost:8000/api/v1 > .env.development
-echo VITE_WS_URL=ws://localhost:8000 >> .env.development
-
-npm run dev          # http://localhost:5173
+npm install && npm run dev     # → http://localhost:5173
 ```
 
-### Docker (Production)
-
-```bash
-docker-compose up --build
-# Visit http://localhost
-```
+Vite proxies `/api` and `/ws` to `localhost:8000` automatically.
 
 ---
 
@@ -169,143 +90,50 @@ docker-compose up --build
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/v1/stock/{ticker}` | Latest price snapshot |
-| `GET` | `/api/v1/stock/{ticker}/history?period=5d&interval=5m` | Historical OHLC candles |
+| `GET` | `/api/v1/stock/{ticker}` | Live price snapshot |
+| `GET` | `/api/v1/stock/{ticker}/history?period=5d&interval=5m` | OHLC candles |
 | `GET` | `/api/v1/stock/{ticker}/analytics` | SMA-20, SMA-50, RSI-14 |
-| `GET` | `/api/v1/portfolio?tickers=AAPL,TSLA` | Batch live prices |
+| `GET` | `/api/v1/portfolio?tickers=AAPL,TSLA` | Batch prices |
 | `POST` | `/api/v1/alerts` | Create price alert |
-| `GET` | `/api/v1/alerts` | List active alerts |
-| `WS` | `/ws/{ticker}` | Live OHLC stream |
+| `WS` | `/ws/{ticker}` | Live candle stream |
 
-**Supported intervals:** `1m` `5m` `15m` `1h` `1d`
-**Supported periods:** `1d` `5d` `1mo` `3mo` `6mo` `1y`
-
-### WebSocket Message Types
-
+**WebSocket messages:**
 ```json
-// Server → Client
-{ "type": "history", "ticker": "AAPL", "data": { "candles": [...] } }
-{ "type": "candle",  "ticker": "AAPL", "data": { "ts":"...", "open":..., "high":..., "low":..., "close":..., "volume":... } }
-{ "type": "alert",   "ticker": "AAPL", "data": { "message": "...", "price": 201.5, "threshold": 200 } }
-{ "type": "error",   "ticker": "AAPL", "data": { "message": "..." } }
-
-// Client → Server
-"ping"
+{ "type": "history", "data": { "candles": [...] } }
+{ "type": "candle",  "data": { "ts":"...", "open":..., "high":..., "low":..., "close":..., "change":..., "change_pct":... } }
+{ "type": "alert",   "data": { "message":"AAPL crossed $200" } }
 ```
 
 ---
 
-## Drawing Tools
+## Connection Status Badge
 
-The chart includes a full annotation toolbar:
-
-| Tool | How to use |
-|------|-----------|
-| ✛ Crosshair | Default — hover to inspect price |
-| ╱ Trend Line | Click & drag between two points |
-| — Horizontal | Click to pin a price level |
-| ▭ Rectangle | Click & drag to mark a zone |
-| Φ Fibonacci | Drag to draw 0–100% retracement levels |
-| T Text | Click to place a text annotation |
-| ⌫ Eraser | Click near a drawing to remove it |
-
-Color picker and **Clear All** button included. Drawings persist during the session.
+| State | Colour | Meaning |
+|---|---|---|
+| `connecting` | 🟡 Amber | Handshake in progress |
+| `connected` | 🔵 Blue | Socket open, awaiting first tick |
+| `live` | 🟢 Green | Price ticks actively arriving |
+| `disconnected` | 🔴 Red | Reconnecting with exponential backoff |
 
 ---
 
 ## Environment Variables
 
 ```bash
-# backend/.env  (never commit this file)
-FINNHUB_API_KEY=your_finnhub_key
-ALPHA_VANTAGE_API_KEY=your_av_key
-DEBUG=false
-
-# frontend/.env.development  (never commit this file)
-VITE_API_URL=http://localhost:8000/api/v1
-VITE_WS_URL=ws://localhost:8000
-
-# frontend/.env.production  (safe to commit — only contains your own backend URL)
-VITE_API_URL=https://your-backend.railway.app/api/v1
-VITE_WS_URL=wss://your-backend.railway.app
+# backend/.env — never commit this
+FINNHUB_API_KEY=your_key
+ALPHA_VANTAGE_API_KEY=your_key   # optional, yfinance is the fallback
 ```
 
-### .gitignore (critical)
+---
+
+## .gitignore
 
 ```
-# Backend
 backend/.env
 backend/*.db
-backend/__pycache__/
 backend/venv/
-
-# Frontend
-frontend/.env.development
-frontend/.env.local
+backend/__pycache__/
+frontend/node_modules/
+frontend/dist/
 ```
-
----
-
-## Deployment (Zero key changes after setup)
-
-API keys live **only on the server** — never in the browser or git history.
-
-```
-Browser → your backend (Railway/Render) → Finnhub / Alpha Vantage
-```
-
-### Railway (recommended)
-
-```bash
-# Install CLI
-npm install -g @railway/cli
-
-# Deploy backend
-cd backend
-railway login
-railway init
-railway up
-
-# Set keys in Railway dashboard → Variables:
-# FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, DEBUG=false
-
-# Copy the Railway URL → frontend/.env.production
-# Deploy frontend to Vercel
-cd ../frontend
-vercel --prod
-```
-
-### Render
-
-1. Push to GitHub
-2. New Web Service → connect repo → set root to `backend/`
-3. Build: `pip install -r requirements.txt`
-4. Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. Add env vars in the **Environment** tab
-
----
-
-## API Rate Limits
-
-| Service | Free Tier | Used for |
-|---------|-----------|---------|
-| Finnhub | 60 req/min | Live price quotes (WebSocket stream) |
-| Alpha Vantage | 25 req/day | OHLC history + analytics |
-
-Alpha Vantage's 25/day limit is the main constraint. To avoid hitting it: avoid refreshing frequently or switching tickers rapidly in development. For production, upgrade to a paid Alpha Vantage plan (75+ req/min).
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Backend Framework | FastAPI + uvicorn |
-| Live Quotes | Finnhub API |
-| OHLC History | Alpha Vantage API |
-| Database | SQLite via aiosqlite |
-| Frontend | React 18 + Vite |
-| State | Zustand |
-| Charts | Pure Canvas2D (custom renderer) |
-| Dates | Luxon |
-| Containerization | Docker + nginx |
