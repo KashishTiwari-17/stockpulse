@@ -1,11 +1,9 @@
 """
-WebSocket manager — pub-sub connection hub.
+websocket/manager.py
 
-FIXES:
-  1. History seed now tries multiple periods (5d, 1mo) so it always finds
-     data even on weekends/holidays when intraday data is unavailable.
-  2. CandleAggregator properly builds 1-min OHLC from live ticks.
-  3. WS responds to ping with pong to keep connection alive.
+FIX: When Finnhub returns price=0 (market closed / free tier limitation),
+     fall back to yfinance which always returns the last known price.
+     This keeps the chart and live price updating even outside market hours.
 """
 
 import asyncio
@@ -14,9 +12,9 @@ import os
 import requests
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from math import floor
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from services.stock import fetch_ohlc
 from services.alerts import register_broadcast, check_alerts_loop
@@ -26,16 +24,18 @@ router = APIRouter()
 
 _rooms: dict[str, set[WebSocket]] = defaultdict(set)
 _tasks: dict[str, asyncio.Task] = {}
+_seed_tasks: dict[int, asyncio.Task] = {}
 
 STREAM_INTERVAL = 5
-FINNHUB_KEY     = os.getenv("FINNHUB_API_KEY")
+
+
+def _finnhub_key() -> str:
+    return os.getenv("FINNHUB_API_KEY", "")
 
 
 # ── Candle aggregator ─────────────────────────────────────────────────────────
 
 class CandleAggregator:
-    """Buckets real-time price ticks into 1-minute OHLC candles."""
-
     def __init__(self, minutes: int = 1):
         self.minutes   = minutes
         self.bucket_ts = None
@@ -100,34 +100,48 @@ async def broadcast(ticker: str, message: dict):
 register_broadcast(broadcast)
 
 
-# ── History seed — tries multiple periods until data is found ─────────────────
+# ── Price fetcher with yfinance fallback ──────────────────────────────────────
 
-SEED_ATTEMPTS = [
-    ("5d",  "5m"),    # most recent: 5 days of 5-min bars
-    ("1mo", "30m"),   # fallback: 1 month of 30-min bars
-    ("3mo", "1d"),    # last resort: 3 months of daily bars
-]
-
-
-async def _seed_history(websocket: WebSocket, ticker: str):
-    for period, interval in SEED_ATTEMPTS:
+def _fetch_price(ticker: str) -> tuple[float, float, float]:
+    """
+    Returns (price, change, change_pct).
+    Tries Finnhub first; if price == 0 (market closed / free-tier gap),
+    falls back to yfinance fast_info which always has the last close.
+    """
+    # 1. Try Finnhub
+    key = _finnhub_key()
+    if key:
         try:
-            candles = await fetch_ohlc(ticker, period=period, interval=interval)
-            if candles and len(candles) > 0:
-                await websocket.send_json({
-                    "type": "history",
-                    "ticker": ticker,
-                    "data": {"candles": [c.model_dump() for c in candles]},
-                })
-                logger.info(
-                    "Seeded %d candles (%s/%s) to %s",
-                    len(candles), period, interval, ticker
-                )
-                return
+            res  = requests.get(
+                "https://finnhub.io/api/v1/quote",
+                params={"symbol": ticker, "token": key},
+                timeout=5,
+            )
+            data = res.json()
+            if "error" in data:
+                logger.warning("Finnhub quote error [%s]: %s", ticker, data["error"])
+            else:
+                price = float(data.get("c", 0))
+                if price > 0:
+                    return price, float(data.get("d", 0)), float(data.get("dp", 0))
         except Exception as e:
-            logger.warning("Seed attempt %s/%s failed for %s: %s", period, interval, ticker, e)
+            logger.warning("Finnhub fetch failed for %s: %s", ticker, e)
 
-    logger.warning("All seed attempts failed for %s — client will rely on live ticks", ticker)
+    # 2. Fallback: yfinance (works 24/7, always returns last close)
+    try:
+        import yfinance as yf
+        info  = yf.Ticker(ticker).fast_info
+        price = float(getattr(info, "last_price", 0) or 0)
+        prev  = float(getattr(info, "previous_close", price) or price)
+        if price > 0:
+            change     = round(price - prev, 4)
+            change_pct = round((change / prev * 100) if prev else 0, 4)
+            logger.debug("yfinance price for %s: %.4f", ticker, price)
+            return price, change, change_pct
+    except Exception as e:
+        logger.warning("yfinance price fallback failed for %s: %s", ticker, e)
+
+    return 0.0, 0.0, 0.0
 
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
@@ -140,67 +154,101 @@ async def _stream_ticker(ticker: str):
 
     while _rooms.get(ticker):
         try:
-            res = requests.get(
-                "https://finnhub.io/api/v1/quote",
-                params={"symbol": ticker, "token": FINNHUB_KEY},
-                timeout=5,
-            )
-            data    = res.json()
-            price   = float(data.get("c", 0))
-            change  = float(data.get("d",  0))
-            chg_pct = float(data.get("dp", 0))
+            price, change, chg_pct = await asyncio.to_thread(_fetch_price, ticker)
 
             if price > 0:
                 completed, current = agg.push(price)
-
                 if completed:
                     await broadcast(ticker, {
                         "type": "candle", "ticker": ticker,
                         "data": {**completed, "change": change, "change_pct": chg_pct},
                     })
-
                 await broadcast(ticker, {
                     "type": "candle", "ticker": ticker,
                     "data": {**current, "change": change, "change_pct": chg_pct},
                 })
             else:
-                logger.warning("No price for %s — check FINNHUB_API_KEY", ticker)
+                logger.warning("No price available for %s", ticker)
 
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             logger.error("Stream error for %s: %s", ticker, e)
 
         await asyncio.sleep(STREAM_INTERVAL)
+
+    logger.info("Stream task exiting for %s", ticker)
+
+
+# ── History seed ──────────────────────────────────────────────────────────────
+
+SEED_ATTEMPTS = [("5d", "5m"), ("1mo", "30m"), ("3mo", "1d")]
+
+
+def _ws_alive(ws: WebSocket) -> bool:
+    return ws.client_state == WebSocketState.CONNECTED
+
+
+async def _seed_history(websocket: WebSocket, ticker: str):
+    for period, interval in SEED_ATTEMPTS:
+        if not _ws_alive(websocket):
+            return
+        try:
+            candles = await fetch_ohlc(ticker, period=period, interval=interval)
+            if not candles:
+                continue
+            if not _ws_alive(websocket):
+                return
+            await websocket.send_json({
+                "type": "history", "ticker": ticker,
+                "data": {"candles": [c.model_dump() for c in candles]},
+            })
+            logger.info("Seeded %d candles (%s/%s) for %s", len(candles), period, interval, ticker)
+            return
+        except Exception as e:
+            logger.warning("Seed %s/%s failed for %s: %s", period, interval, ticker, e)
+
+    logger.warning("All seed attempts failed for %s", ticker)
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
 
 @router.websocket("/ws/{ticker}")
 async def websocket_endpoint(websocket: WebSocket, ticker: str):
-    print(f"WS: incoming for {ticker}")
+    await websocket.accept()
+    ticker = ticker.upper()
+    logger.info("WS connected: %s", ticker)
+
+    _rooms[ticker].add(websocket)
+
+    existing = _tasks.get(ticker)
+    if not existing or existing.done():
+        if existing:
+            existing.cancel()
+        _tasks[ticker] = asyncio.create_task(_stream_ticker(ticker))
+
+    seed_task = asyncio.create_task(_seed_history(websocket, ticker))
+    _seed_tasks[id(websocket)] = seed_task
+
     try:
-        await websocket.accept()
-        ticker = ticker.upper()
-        _rooms[ticker].add(websocket)
-
-        await _seed_history(websocket, ticker)
-
-        if ticker not in _tasks or _tasks[ticker].done():
-            _tasks[ticker] = asyncio.create_task(_stream_ticker(ticker))
-
         while True:
-            try:
-                msg = await websocket.receive_text()
-                if msg == "ping":
-                    await websocket.send_text("pong")
-            except Exception as e:
-                print(f"WS receive closed for {ticker}: {e}")
-                break
+            msg = await websocket.receive_text()
+            if msg == "ping" and _ws_alive(websocket):
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        logger.info("WS disconnected: %s", ticker)
     except Exception as e:
-        print(f"WS FATAL: {e}")
-        import traceback; traceback.print_exc()
+        logger.warning("WS closed for %s: %s", ticker, e)
     finally:
-        _rooms.get(ticker, set()).discard(websocket)
-        print(f"WS: disconnected {ticker}")
+        st = _seed_tasks.pop(id(websocket), None)
+        if st and not st.done():
+            st.cancel()
+        _rooms[ticker].discard(websocket)
+        if not _rooms[ticker]:
+            task = _tasks.pop(ticker, None)
+            if task:
+                task.cancel()
+            logger.info("Stream task stopped for %s (no subscribers)", ticker)
 
 
 async def start_background_tasks():
